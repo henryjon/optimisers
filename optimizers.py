@@ -1,22 +1,26 @@
+import time
 import numpy as np
+import pandas as pd
 
 import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
 
+# import torch.optim as optim
+
 import gzip
 
-
-# import torch.optim as optim
+pd.set_option("display.max_rows", 500)
+pd.set_option("display.max_columns", 500)
+pd.set_option("display.width", 1000)
 
 
 filenames = {
-    tot: {
-        name: f"../mnist/train-{name}-idx{n}-ubyte.gz"
-        for name, n in [("images", 3), ("labels", 1)]
+    "train": {
+        "images": "../mnist/train-images-idx3-ubyte.gz",
+        "labels": "../mnist/train-labels-idx1-ubyte.gz",
     }
-    for tot, prefix in [("train", "train"), ("test", "t10k")]
 }
 
 image_size = 28
@@ -43,8 +47,6 @@ def data_reader(tot, iol, hn):
 
 
 train_images = data_reader("train", "images", 16)
-
-
 train_labels = data_reader("train", "labels", 8)
 
 
@@ -63,10 +65,9 @@ print()
 class MLP(nn.Module):
     def __init__(self):
         super(MLP, self).__init__()
-        self.l1 = nn.Linear(784, 100)
-        self.l2 = nn.Linear(100, 10)
-        # self.l1 = nn.Linear(2, 2)
-        # self.l2 = nn.Linear(2, 2)
+        self.hidden_size = 20
+        self.l1 = nn.Linear(784, self.hidden_size)
+        self.l2 = nn.Linear(self.hidden_size, 10)
 
     def forward(self, *xs):
         out = []
@@ -96,66 +97,115 @@ class Optimizer:
                 p.grad.zero_()
 
 
-class SGD0(Optimizer):
-    def __init__(self, params, lr):
-        super().__init__(params, needs_loss_function=False)
+class Optimizer_smoothed(Optimizer):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.grad_size_ewma = None
+        self.smoothing = 0.1
+
+    def grad_norm(self):
+
+        return sum(p.grad.norm() for p in self.params())
+
+    def update_grad_size_ewma(self):
+        grad_norm = self.grad_norm()
+
+        if self.grad_size_ewma is None:
+            self.grad_size_ewma = grad_norm
+
+        self.grad_size_ewma = (self.smoothing) * grad_norm + (
+            1 - self.smoothing
+        ) * self.grad_size_ewma
+
+
+class SGD0(Optimizer_smoothed):
+    def __init__(self, lr, **kwargs):
+        super().__init__(needs_loss_function=False, **kwargs)
         self.lr = lr
+
+    def stats(self):
+        return {"lr": self.lr}
 
     def step(self):
 
+        self.update_grad_size_ewma()
+
+        grad_norm = self.grad_norm()
         for p in self.params():
 
             g = p.grad
-            p.data = p.data - self.lr * g
+            p.data = p.data - self.lr * self.grad_size_ewma * (g / grad_norm)
 
 
-class SGD1(Optimizer):
-    def __init__(self, params, lr0, lrlr):
-        super().__init__(params, needs_loss_function=True)
+class SGD1(Optimizer_smoothed):
+    def __init__(self, lr0, lrlr, update_freq=1, **kwargs):
+        super().__init__(needs_loss_function=True, **kwargs)
+        self.lr0 = lr0
         self.lr = lr0
         self.lrlr = lrlr
-        self.lr_store = [lr0]
+        self.lrs = []
+        self.update_freq = update_freq
+        self.count = 0
+        self.losses = []
+        self.grad_size_ewma = None
+
+    def stats(self):
+        return {"lr0": self.lr0, "lr": self.lr, "lrlr": self.lrlr}
 
     def step(self, loss_fn, loss_fn_args):
 
         initial_parameters_and_grads = [(p.data.clone(), p.grad) for p in self.params()]
 
-        losses = []
+        if (self.count % self.update_freq) == 0:
 
-        lrs = [self.lr * i for i in [1, self.lrlr]]
-        for lr in lrs:
-            for p, (p_init, g) in zip(self.params(), initial_parameters_and_grads):
-                p.data = p_init - lr * g
+            losses = []
 
-            losses.append(loss_fn(**loss_fn_args))
+            lrs = [self.lr * i for i in [1, self.lrlr]]
+            for lr in lrs:
+                for p, (p_init, g) in zip(self.params(), initial_parameters_and_grads):
+                    p.data = p_init - lr * g
 
-        ix_min = min(range(len(losses)), key=lambda i: losses[i])
-        if ix_min == 0:
-            self.lr /= self.lrlr
-        elif ix_min == 1:
-            self.lr *= self.lrlr
-        else:
-            raise Exception("Unreachable")
+                losses.append(loss_fn(**loss_fn_args))
 
-        self.lr_store.append(self.lr)
+            loss_min = min(losses)
+            ix_min = min(range(len(losses)), key=lambda i: losses[i])
 
+            if ix_min == 0:
+                # Reduce the learning rate before updating
+                self.lr /= self.lrlr
+            elif ix_min == 1:
+                # Increase the learning rate before updating
+                self.lr *= self.lrlr
+            else:
+                raise Exception("Unreachable")
+
+        self.update_grad_size_ewma()
+
+        grad_norm = self.grad_norm()
         for p, (p_init, g) in zip(self.params(), initial_parameters_and_grads):
-            p.data = p_init.data - self.lr * g
+            p.data = p_init.data - self.lr * self.grad_size_ewma * (g / grad_norm)
+
+        self.count += 1
+        self.lrs.append(self.lr)
+        self.losses.append(loss_min)
 
 
 class Experiment:
-    def __init__(self, optimiser, n_epochs, optimiser_args=None):
-        if optimiser_args is None:
-            optimiser_args = {}
+    def __init__(self, optimizer, n_epochs, optimizer_args=None):
+        if optimizer_args is None:
+            optimizer_args = {}
 
         self.n_epochs = n_epochs
 
         self.nn = MLP()
-        self.optimiser = optimiser(self.nn.parameters, **optimiser_args)
-        self.loss = nn.functional.cross_entropy
-        self.batch_size = 1024
 
-    def stats(self, images, labels):
+        self.optimizer = optimizer(params=self.nn.parameters, **optimizer_args)
+        self.loss = nn.functional.cross_entropy
+        self.batch_size = 1000
+        self.start_time = time.time()
+        self.stats = None
+
+    def stats_on(self, images, labels):
 
         with torch.no_grad():
             y_hat_train = self.nn.forward(images)
@@ -165,30 +215,31 @@ class Experiment:
             accuracy = n_correct / len(train_labels)
 
             stats = {"accuracy": accuracy, "loss": loss_train}
+            stats.update(self.optimizer.stats())
             return stats
 
     def loss_fn(self, images, labels):
-        return self.stats(images, labels)["loss"]
+        return self.stats_on(images, labels)["loss"]
 
     def train_one_epoch(self, train_x, train_y):
         x_batches = torch.split(train_x, self.batch_size)
         y_batches = torch.split(train_y, self.batch_size)
 
         for x_batch, y_batch in zip(x_batches, y_batches):
-            self.optimiser.zero_grad()
+            self.optimizer.zero_grad()
             y_hat_batch = self.nn.forward(x_batch)
             loss_batch = self.loss(y_hat_batch, y_batch)
             loss_batch.backward()
 
-            if self.optimiser.needs_loss_function:
+            if self.optimizer.needs_loss_function:
 
-                self.optimiser.step(
+                self.optimizer.step(
                     self.loss_fn, {"images": x_batch, "labels": y_batch}
                 )
             else:
-                self.optimiser.step()
+                self.optimizer.step()
 
-    def run_and_return_stats(self, verbose=False):
+    def run(self, verbose=False, plot_lrs=False):
 
         if verbose:
             print("Parameters shape")
@@ -201,7 +252,7 @@ class Experiment:
                 print(f"Epoch: {epoch}")
             self.train_one_epoch(train_images, train_labels)
 
-            stats = self.stats(train_images, train_labels)
+            stats = self.stats_on(train_images, train_labels)
 
             if verbose:
                 loss_train, accuracy = [stats[x] for x in ["loss", "accuracy"]]
@@ -209,47 +260,107 @@ class Experiment:
                 print(f"Accuracy: {100 * accuracy : .1f}%")
                 print()
 
-        if self.optimiser.needs_loss_function:
-            plt.plot(self.optimiser.lr_store)
-            plt.show()
+        stop_time = time.time()
 
-        return {"train_" + i: stats[i] for i in stats}
+        stats["run_time"] = stop_time - self.start_time
+        self.stats = stats
+
+        if plot_lrs:
+
+            x = np.linspace(0, self.n_epochs, num=self.optimizer.count)
+
+            plt.title("Log learning rate")
+            plt.xlabel("epoch")
+            plt.plot(x, np.log10(self.optimizer.lrs))
+            name = f"lr0-{self.optimizer.lr0}-hidden_size-{self.nn.hidden_size}.png"
+
+            plt.savefig("plots/lr-" + name)
+            plt.clf()
+
+            plt.title("Log loss")
+            plt.xlabel("epoch")
+            plt.plot(x[10:], np.log10(self.optimizer.losses)[10:])
+
+            plt.savefig("plots/loss-" + name)
+            plt.clf()
 
 
-def main(test=True):
-
-    n_epochs = 8
-    # SDG0
+def main(test):
 
     if test:
-        lrs = [0.005]
+        lrs = [0.005, 0.01]
+        n_runs = 3
+        n_epochs = 5
     else:
-        lrs = [10 ** (-1 * i) for i in np.linspace(2, 5, num=8)]
+        lrs = [10 ** (-1 * i) for i in np.linspace(2, 5, num=10)]
+        n_runs = 10
+        n_epochs = 10
 
     lrs = sorted(lrs)
+    lr0s = lrs.copy()
 
-    losses = []
-    acs = []
+    def string_from_list(dic_list, sort_column):
+        df = pd.DataFrame(dic_list)
+        df = pd.merge(
+            df.groupby("id").mean(),
+            df.groupby("id").std(),
+            on="id",
+            suffixes=("_mean", "_std"),
+        )
 
-    for lr in lrs:
+        df.sort_values(sort_column, inplace=True)
+        return df.to_string(
+            columns=[
+                sort_column,
+                "accuracy_mean",
+                "accuracy_std",
+                "loss_mean",
+                "loss_std",
+            ],
+            index=False,
+            formatters={
+                k: v.format
+                for k, v in {
+                    "loss_mean": "{:.2f}",
+                    "loss_std": "{:.2f}",
+                    "accuracy_mean": "{:.1%}",
+                    "accuracy_std": "{:.1%}",
+                }.items()
+            },
+        )
+        return df
 
-        e = Experiment(SGD0, n_epochs, {"lr": lr})
-        run_stats = e.run_and_return_stats(verbose=False)
-        loss, ac = [run_stats["train_" + x] for x in ["loss", "accuracy"]]
-        losses.append(loss)
-        acs.append(ac)
-        print(f"{lr:8.6f} {loss:8.3f} {ac:8.3f}")
+    # SDG0
+
+    stats_dics = []
+    for count in range(n_runs):
+        print(count)
+        for lr in lrs:
+
+            e = Experiment(SGD0, n_epochs, {"lr": lr})
+            e.run(verbose=False)
+            e.stats["count"] = count
+            e.stats["id"] = str(lr)
+            stats_dics.append(e.stats)
+    summary_str0 = string_from_list(stats_dics, sort_column="lr_mean")
+    print(summary_str0)
 
     # SGD1
 
-    e = Experiment(SGD1, n_epochs // 2, {"lr0": 0.001, "lrlr": 1.03})
-    run_stats = e.run_and_return_stats(verbose=False)
+    stats_dics = []
+    for count in range(n_runs):
+        print(count)
+        for lr0 in lr0s:
+            e = Experiment(SGD1, n_epochs, {"lr0": lr0, "lrlr": 1.01})
+            plot_lrs = count == n_runs - 1
+            e.run(verbose=False, plot_lrs=plot_lrs)
+            e.stats["count"] = count
+            e.stats["id"] = str(lr0)
+            stats_dics.append(e.stats)
 
-    loss, ac = [run_stats["train_" + x] for x in ["loss", "accuracy"]]
-    print("loss     acc")
-    print(f"{loss:8.3f} {ac:8.3f}")
-
-    plt.show()
+    summary_str1 = string_from_list(stats_dics, sort_column="lr0_mean")
+    print(summary_str1)
 
 
-main(test=True)
+if __name__ == "__main__":
+    main(test=False)
