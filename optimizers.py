@@ -167,7 +167,7 @@ class SGD1(Optimizer_smoothed):
 
                 losses.append(loss_fn(**loss_fn_args))
 
-            loss_min = min(losses)
+            loss = min(losses)
             ix_min = min(range(len(losses)), key=lambda i: losses[i])
 
             if ix_min == 0:
@@ -178,6 +178,8 @@ class SGD1(Optimizer_smoothed):
                 self.lr *= self.lrlr
             else:
                 raise Exception("Unreachable")
+        else:
+            loss = loss_fn(**loss_fn_args)
 
         self.update_grad_size_ewma()
 
@@ -187,7 +189,7 @@ class SGD1(Optimizer_smoothed):
 
         self.count += 1
         self.lrs.append(self.lr)
-        self.losses.append(loss_min)
+        self.losses.append(loss)
 
 
 class Experiment:
